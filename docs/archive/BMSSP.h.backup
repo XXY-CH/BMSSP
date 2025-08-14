@@ -1,0 +1,701 @@
+// BMSSP.h - Pseudocode-faithful translation of Algorithm 1~3 + Lemmas interface
+// Based solely on the paper's specification (FindPivots, BaseCase, BMSSP main),
+// without referencing other algorithms beyond what the paper allows.
+#pragma once
+#include "Graph.h"
+#include <vector>
+#include <queue>
+#include <deque>
+#include <set>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <chrono>
+#include <stdexcept>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <cctype>
+
+// Compile-time gating for debug logs; set -DBMSSP_ENABLE_DEBUG=1 to include runtime debug.
+#ifndef BMSSP_ENABLE_DEBUG
+#define BMSSP_ENABLE_DEBUG 0
+#endif
+
+struct BMSSPResult
+{
+  double Bprime;             // new boundary B'
+  std::vector<int> X;        // set X that becomes complete
+  std::vector<double> Xdist; // true distances of X (aligned with X)
+};
+
+// BlockQueue per Lemma 3.3: optimized for Insert/BatchPrepend/Pull time complexity
+class BlockQueue
+{
+public:
+  struct Item
+  {
+    int key;
+    double val;
+  };
+
+  BlockQueue() = default;
+  BlockQueue(int M, double B) : block_size(M), upper_bound(B) { init(M, B); }
+
+  void init(int M, double B)
+  {
+    block_size = std::max(1, M);
+    upper_bound = B;
+    present.clear();
+    D1_blocks.clear();
+    D0_blocks.clear();
+    D1_heap.clear();
+  }
+
+  // Insert: O(max{1, log(N/M)}) amortized
+  void insert(int key, double val)
+  {
+    if (!(val < upper_bound)) return;
+    
+    auto it = present.find(key);
+    if (it != present.end() && val >= it->second) return;
+    
+    present[key] = val;
+    
+    // Find appropriate block in D1 or create new one
+    int target_block = findOrCreateBlock(val);
+    D1_blocks[target_block].emplace_back(Item{key, val});
+    
+    // Split if block becomes too large
+    if ((int)D1_blocks[target_block].size() > block_size)
+      splitBlock(target_block);
+  }
+
+  // BatchPrepend: O(L·max{1, log(L/M)}) amortized  
+  void batchPrepend(const std::vector<Item> &batch)
+  {
+    if (batch.empty()) return;
+    
+    // Update present map
+    for (const auto &item : batch)
+    {
+      if (!(item.val < upper_bound)) continue;
+      auto it = present.find(item.key);
+      if (it == present.end() || item.val < it->second)
+        present[item.key] = item.val;
+    }
+    
+    // Create new blocks for D0 (batch prepend goes to D0)
+    std::vector<Item> valid_items;
+    for (const auto &item : batch)
+    {
+      if (item.val < upper_bound)
+      {
+        auto it = present.find(item.key);
+        if (it != present.end() && it->second == item.val)
+          valid_items.push_back(item);
+      }
+    }
+    
+    if (valid_items.empty()) return;
+    
+    // Partition into blocks of size at most block_size
+    for (size_t i = 0; i < valid_items.size(); i += block_size)
+    {
+      std::vector<Item> new_block;
+      size_t end = std::min(i + block_size, valid_items.size());
+      for (size_t j = i; j < end; ++j)
+        new_block.push_back(valid_items[j]);
+      
+      // Sort this block internally
+      std::sort(new_block.begin(), new_block.end(), 
+                [](const Item &a, const Item &b) { return a.val < b.val; });
+      
+      D0_blocks.push_front(std::move(new_block));
+    }
+  }
+
+  // Pull: O(|S'|) amortized
+  std::pair<std::vector<int>, double> pull()
+  {
+    if (present.empty()) return {{}, upper_bound};
+    
+    std::vector<Item> candidates;
+    candidates.reserve(block_size);
+    
+    // Collect from D0 first (smaller values)
+    pullFromD0(candidates);
+    
+    // Then collect from D1 if needed
+    if ((int)candidates.size() < block_size)
+      pullFromD1(candidates);
+    
+    if (candidates.empty()) return {{}, upper_bound};
+    
+    // Sort candidates and take smallest block_size items
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Item &a, const Item &b) { return a.val < b.val; });
+    
+    int take_count = std::min(block_size, (int)candidates.size());
+    std::vector<int> result;
+    result.reserve(take_count);
+    
+    for (int i = 0; i < take_count; ++i)
+    {
+      result.push_back(candidates[i].key);
+      present.erase(candidates[i].key);
+    }
+    
+    // Determine separator
+    double sep = upper_bound;
+    if (!present.empty())
+    {
+      // Find minimum remaining value
+      double min_remaining = upper_bound;
+      for (const auto &p : present)
+        min_remaining = std::min(min_remaining, p.second);
+      sep = min_remaining;
+    }
+    
+    return {result, sep};
+  }
+
+  bool empty() const { return present.empty(); }
+
+private:
+  int block_size = 1;
+  double upper_bound = INF_DIST;
+  
+  // Two sequences of blocks as per paper
+  std::deque<std::vector<Item>> D0_blocks; // From BatchPrepend
+  std::vector<std::vector<Item>> D1_blocks; // From Insert
+  std::vector<double> D1_heap; // Block upper bounds for D1
+  
+  std::unordered_map<int, double> present; // Authoritative values
+
+  int findOrCreateBlock(double val)
+  {
+    // Binary search for appropriate block in D1
+    auto it = std::lower_bound(D1_heap.begin(), D1_heap.end(), val);
+    int idx = it - D1_heap.begin();
+    
+    if (idx == (int)D1_heap.size())
+    {
+      // Create new block
+      D1_blocks.emplace_back();
+      D1_heap.push_back(upper_bound);
+    }
+    return idx;
+  }
+  
+  void splitBlock(int block_idx)
+  {
+    auto &block = D1_blocks[block_idx];
+    if ((int)block.size() <= block_size) return;
+    
+    // Find median and split
+    std::nth_element(block.begin(), block.begin() + block.size()/2, block.end(),
+                     [](const Item &a, const Item &b) { return a.val < b.val; });
+    
+    double median = block[block.size()/2].val;
+    
+    std::vector<Item> new_block;
+    auto it = std::partition(block.begin(), block.end(),
+                            [median](const Item &item) { return item.val < median; });
+    
+    new_block.assign(it, block.end());
+    block.erase(it, block.end());
+    
+    // Insert new block
+    D1_blocks.insert(D1_blocks.begin() + block_idx + 1, std::move(new_block));
+    D1_heap.insert(D1_heap.begin() + block_idx + 1, D1_heap[block_idx]);
+    D1_heap[block_idx] = median;
+  }
+  
+  void pullFromD0(std::vector<Item> &candidates)
+  {
+    while (!D0_blocks.empty() && (int)candidates.size() < block_size)
+    {
+      auto &front_block = D0_blocks.front();
+      for (const auto &item : front_block)
+      {
+        auto it = present.find(item.key);
+        if (it != present.end() && it->second == item.val)
+        {
+          candidates.push_back(item);
+          if ((int)candidates.size() >= block_size) break;
+        }
+      }
+      D0_blocks.pop_front();
+    }
+  }
+  
+  void pullFromD1(std::vector<Item> &candidates)
+  {
+    for (size_t i = 0; i < D1_blocks.size() && (int)candidates.size() < block_size; ++i)
+    {
+      auto &block = D1_blocks[i];
+      auto it = block.begin();
+      while (it != block.end() && (int)candidates.size() < block_size)
+      {
+        auto present_it = present.find(it->key);
+        if (present_it != present.end() && present_it->second == it->val)
+        {
+          candidates.push_back(*it);
+          it = block.erase(it);
+        }
+        else
+        {
+          it = block.erase(it); // Remove stale entry
+        }
+      }
+      
+      // Remove empty blocks
+      if (block.empty())
+      {
+        D1_blocks.erase(D1_blocks.begin() + i);
+        D1_heap.erase(D1_heap.begin() + i);
+        --i;
+      }
+    }
+  }
+};
+
+// Algorithm 2 (BaseCase): solve single-source shortest paths from a complete root k
+static BMSSPResult BaseCase(const Graph &g, int k, double B,
+                            std::vector<double> &dist,
+                            int Sigma)
+{
+  // Run Dijkstra from k up to boundary B
+  std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>, std::greater<>> pq;
+  std::vector<double> local_dist(g.n, INF_DIST);
+  std::vector<bool> processed(g.n, false);
+
+  local_dist[k] = dist[k];
+  pq.push({dist[k], k});
+
+  std::vector<std::pair<int, double>> completed; // vertices that become complete
+
+  while (!pq.empty())
+  {
+    auto [d, u] = pq.top();
+    pq.pop();
+
+    if (processed[u] || d > local_dist[u] || d >= B)
+      continue;
+
+    processed[u] = true;
+
+    // Update global distance and record completion
+    if (local_dist[u] < dist[u])
+    {
+      dist[u] = local_dist[u];
+      if (u != k)
+        completed.push_back({u, local_dist[u]});
+    }
+
+    for (const auto &e : g.adj[u])
+    {
+      double nd = d + e.w;
+      if (nd < B && nd < local_dist[e.to])
+      {
+        local_dist[e.to] = nd;
+        pq.push({nd, e.to});
+      }
+    }
+  }
+
+  // Return all vertices that became complete
+  std::vector<int> X;
+  std::vector<double> Xdist;
+  for (auto &p : completed)
+  {
+    X.push_back(p.first);
+    Xdist.push_back(p.second);
+  }
+
+  return {B, X, Xdist};
+}
+
+// Algorithm 1 (FindPivots): k-step Bellman-Ford relaxation to find pivots P and working set W
+static void FindPivots(const Graph &g, double B, const std::vector<int> &F, int Sigma,
+                       std::vector<double> &dist,
+                       std::vector<int> &P, std::vector<int> &W)
+{
+  // Algorithm 1 from paper: k-step relaxation under bound B
+  const int n = g.n;
+  std::vector<double> dv(n, INF_DIST); // local distance estimates
+  std::vector<int> root(n, -1);        // root assignment for forest computation
+
+  // Initialize W with F and set up local distances
+  W.clear();
+  std::vector<int> curr;
+  for (int r : F)
+  {
+    if (0 <= r && r < n && dist[r] < B)
+    {
+      dv[r] = dist[r];
+      root[r] = r;
+      curr.push_back(r);
+      W.push_back(r);
+    }
+  }
+
+  // Perform Sigma rounds of relaxation
+  for (int round = 0; round < Sigma && !curr.empty(); ++round)
+  {
+    std::vector<int> next;
+    for (int u : curr)
+    {
+      if (!(dv[u] < B))
+        continue;
+      for (const auto &e : g.adj[u])
+      {
+        double nd = dv[u] + e.w;
+        if (nd < B && nd <= dv[e.to]) // allow equality per Remark 3.4
+        {
+          if (nd < dv[e.to])
+          {
+            dv[e.to] = nd;
+            root[e.to] = root[u];
+            next.push_back(e.to);
+          }
+          W.push_back(e.to);
+        }
+      }
+    }
+    curr.swap(next);
+
+    // Early termination if W becomes too large
+    if ((int)W.size() > Sigma * (int)F.size())
+    {
+      P = F; // return P=F per lemma
+      return;
+    }
+  }
+
+  // Compute subtree sizes and select pivots with size >= Sigma
+  std::unordered_map<int, int> subtree_size;
+  for (int v : W)
+  {
+    if (root[v] != -1)
+      subtree_size[root[v]]++;
+  }
+
+  P.clear();
+  for (int r : F)
+  {
+    if (subtree_size[r] >= Sigma)
+      P.push_back(r);
+  }
+}
+
+// Algorithm 3 (BMSSP): main recursion level = ell, with bound B, frontier F.
+class BMSSPAlgo
+{
+private:
+  static constexpr int pow2(int x) { return (x <= 0) ? 1 : (1 << x); }
+  
+  const Graph &g;
+  int s;
+  int Sigma, Tau;
+  std::vector<double> dist;
+  std::vector<std::pair<int, int>> completeLog;
+  std::chrono::steady_clock::time_point startTime{};
+
+public:
+  BMSSPAlgo(const Graph &g_, int s_, int /*n_*/, int Sigma_, int Tau_)
+      : g(g_), s(s_), Sigma(Sigma_), Tau(Tau_), dist(g_.n, INF_DIST)
+  {
+    dist[s] = 0.0;
+    // Calculate parameters using natural log as per paper
+    int N = std::max(1, g_.n);
+    double L = std::log((double)N);
+    // Override with paper's formula if environment variables not set
+    if (Sigma_ == 0)
+      Sigma = std::max(1, (int)std::floor(std::pow(L, 1.0 / 3.0)));
+    if (Tau_ == 0)
+      Tau = std::max(1, (int)std::floor(std::pow(L, 2.0 / 3.0)));
+  }
+  const std::vector<double> &distances() const { return dist; }
+  const std::vector<std::pair<int, int>> &completions() const { return completeLog; }
+
+  BMSSPResult run(int ell, double B, const std::vector<int> &F)
+  {
+    auto now = std::chrono::steady_clock::now();
+    if (startTime.time_since_epoch().count() == 0)
+      startTime = now;
+    if (std::chrono::duration<double>(now - startTime).count() > 5.0)
+      throw std::runtime_error("BMSSP timeout >5s at ell=" + std::to_string(ell));
+#if BMSSP_ENABLE_DEBUG
+    static bool debug = []()
+    {
+      const char *p = std::getenv("BMSSP_DEBUG");
+      if (!p)
+        return false;
+      // accept: 1, true, yes (case-insensitive)
+      std::string v(p);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c)
+                     { return std::tolower(c); });
+      return (v == "1" || v == "true" || v == "yes");
+    }();
+#else
+    constexpr bool debug = false;
+#endif
+    if (ell == 0)
+    { // Base case
+      if (F.empty())
+        return {B, {}};
+      return BaseCase(g, F[0], B, dist, Sigma);
+    }
+    std::vector<int> P, A;
+    // Algorithm 1: Find pivots P and working set W=A
+    FindPivots(g, B, F, Sigma, dist, P, A);
+
+    // If |W| > Σ|F|, FindPivots returns P=F, and we should fall back to base case
+    if (P.size() == F.size() && std::equal(P.begin(), P.end(), F.begin()) && A.size() > Sigma * F.size())
+    {
+      if (!F.empty())
+        return BaseCase(g, F[0], B, dist, Sigma);
+      else
+        return {B, {}};
+    }
+    const int M = pow2(ell - 1) * Tau; // M = 2^{ell-1} * Tau
+    BlockQueue dq(M, B);
+    dq.init(M, B);
+    // Insert pivots only
+    for (int v : P)
+    {
+      double key = dist[v];
+      if (std::isfinite(key) && key < B)
+        dq.insert(v, key);
+    }
+    double B0prime;
+    // Initialize B0' as min d[x] over P
+    if (!P.empty())
+    {
+      B0prime = dist[P[0]];
+      for (int v : P)
+        if (dist[v] < B0prime)
+          B0prime = dist[v];
+    }
+    else
+    {
+      B0prime = INF_DIST;
+      if (debug)
+      {
+        std::fprintf(stderr,
+                     "[BMSSP] ell=%d init: |F|=%zu |P|=%zu M=%d B=%.6g B0'=INF\n",
+                     ell, F.size(), P.size(), M, B);
+      }
+    }
+    // Main loop: optimized to reduce empty pulls and redundant operations
+    while (!dq.empty())
+    {
+      auto now2 = std::chrono::steady_clock::now();
+      if (std::chrono::duration<double>(now2 - startTime).count() > 5.0)
+        throw std::runtime_error("BMSSP timeout >5s in-loop at ell=" + std::to_string(ell));
+      
+      auto [Fnext, Bsep] = dq.pull();
+      if (Fnext.empty())
+      {
+        // Empty pull - terminate with current separator
+        if (debug)
+          std::fprintf(stderr, "[BMSSP] ell=%d pull empty, sep=%.6g\n", ell, Bsep);
+        B0prime = Bsep;
+        break;
+      }
+      
+      if (debug)
+        std::fprintf(stderr, "[BMSSP] ell=%d pulled |Si|=%zu Bi=%.6g\n", ell, Fnext.size(), Bsep);
+      
+      // Process batch: single batch for most cases, individual for base level
+      if (ell == 1 && Fnext.size() > 1)
+      {
+        // Process each pivot individually at base level
+        for (int k : Fnext)
+        {
+          BMSSPResult sub = run(0, Bsep, {k});
+          Ucount += sub.X.size();
+          Uacc.insert(Uacc.end(), sub.X.begin(), sub.X.end());
+          
+          if (k >= 0 && k < (int)completeLog.size())
+          {
+            for (int u : sub.X)
+              completeLog.emplace_back(u, k);
+          }
+          
+          // Update distances and relax edges
+          for (size_t i = 0; i < sub.X.size(); ++i)
+          {
+            int u = sub.X[i];
+            double du = sub.Xdist[i];
+            if (du < dist[u]) dist[u] = du;
+          }
+          
+          processEdgeRelaxation(sub.X, Bsep, sub.Bprime, B, dq);
+          
+          // Early termination check
+          const size_t Ulimit = (size_t)Sigma * (size_t)pow2(ell) * (size_t)Tau;
+          if (Ucount > Ulimit)
+          {
+            B0prime = sub.Bprime;
+            goto main_loop_exit;
+          }
+        }
+      }
+      else
+      {
+        // Process as single batch
+        BMSSPResult sub = run(ell - 1, Bsep, Fnext);
+        Ucount += sub.X.size();
+        Uacc.insert(Uacc.end(), sub.X.begin(), sub.X.end());
+        
+        // Update distances and relax edges
+        for (size_t i = 0; i < sub.X.size(); ++i)
+        {
+          int u = sub.X[i];
+          double du = sub.Xdist[i];
+          if (du < dist[u]) dist[u] = du;
+        }
+        
+        processEdgeRelaxation(sub.X, Bsep, sub.Bprime, B, dq);
+        
+        // Early termination check
+        const size_t Ulimit = (size_t)Sigma * (size_t)pow2(ell) * (size_t)Tau;
+        if (Ucount > Ulimit)
+        {
+          B0prime = sub.Bprime;
+          break;
+        }
+      }
+    }
+    
+main_loop_exit:
+    // If we exit due to empty queue, set B0prime = B
+    if (dq.empty() && B0prime == 0)
+      B0prime = B;
+
+    // Finalize: include vertices from A whose dist < B'
+    if (!std::isfinite(B0prime))
+      B0prime = B;
+    
+    // Return U = union of proven-complete vertices filtered by dist < B'
+    std::vector<char> mark(g.n, 0);
+    std::vector<int> X;
+    X.reserve(Uacc.size());
+    for (int v : Uacc)
+    {
+      if (!mark[v] && dist[v] < B0prime)
+      {
+        mark[v] = 1;
+        X.push_back(v);
+      }
+    }
+    
+    // Include vertices from A (working set) with dist < B'
+    for (int v : A)
+    {
+      if (!mark[v] && dist[v] < B0prime)
+      {
+        mark[v] = 1;
+        X.push_back(v);
+      }
+    }
+    
+    std::vector<double> Xd;
+    Xd.reserve(X.size());
+    for (int v : X)
+      Xd.push_back(dist[v]);
+    
+    return {B0prime, X, Xd};
+  }
+
+private:
+  // Helper function for edge relaxation and queue updates
+  void processEdgeRelaxation(const std::vector<int> &completed_vertices,
+                            double Bsep, double Bprime, double B,
+                            BlockQueue &dq)
+  {
+    std::vector<BlockQueue::Item> localPending;
+    localPending.reserve(completed_vertices.size() * 4); // Estimate
+    
+    for (int u : completed_vertices)
+    {
+      for (const auto &e : g.adj[u])
+      {
+        double cand = dist[u] + e.w;
+        if (cand <= dist[e.to])
+        {
+          dist[e.to] = cand;
+          
+          // Direct Insert: [Bsep, B)
+          if (cand >= Bsep && cand < B)
+            dq.insert(e.to, cand);
+          // BatchPrepend later: [Bprime, Bsep)  
+          else if (cand >= Bprime && cand < Bsep)
+            localPending.push_back({e.to, cand});
+        }
+      }
+    }
+    
+    // Batch prepend all candidates in [Bprime, Bsep)
+    if (!localPending.empty())
+      dq.batchPrepend(localPending);
+  }
+        }
+        size_t cntA = 0, cntB = 0;
+        std::vector<BlockQueue::Item> localPending;
+        // relax outgoing edges from sub.X
+        for (int u : sub.X)
+        {
+          for (const auto &e : g.adj[u])
+          {
+            double cand = dist[u] + e.w;
+            if (cand <= dist[e.to])
+            { // allow equality, per Remark 3.4
+              dist[e.to] = cand;
+              // (a) [B_i, B)  -> direct Insert
+              if (cand >= Bsep && cand < B)
+              {
+                ++cntA;
+                dq.insert(e.to, cand);
+              }
+              // (b) [B'_i, B_i) -> BatchPrepend later
+              else if (cand >= sub.Bprime && cand < Bsep)
+              {
+                ++cntB;
+                localPending.emplace_back(BlockQueue::Item{e.to, cand});
+              }
+            }
+          }
+        }
+        // batch prepend candidates in [B'_i, B_i)
+        if (!localPending.empty())
+          dq.batchPrepend(localPending);
+        // batch prepend Si keys whose current dist in [B'_i, B_i)
+        std::vector<BlockQueue::Item> rebatch;
+        rebatch.reserve(Si.size());
+        for (int v : Si)
+        {
+          double dv = dist[v];
+          if (dv >= sub.Bprime && dv < Bsep)
+            rebatch.push_back({v, dv});
+        }
+        if (!rebatch.empty())
+          dq.batchPrepend(rebatch);
+        cntA_total += cntA;
+  }
+
+  static constexpr int pow2(int x) { return 1 << x; }
+
+  const Graph &g;
+  int s;
+  int Sigma, Tau;
+  std::vector<double> dist;
+  std::vector<std::pair<int, int>> completeLog;
+  std::chrono::steady_clock::time_point startTime{};
+};
+};

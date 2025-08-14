@@ -1,0 +1,5 @@
+variant,n,outdeg,seed,sigma,tau,bmssp_time_s,dijkstra_time_s,ratio,checked,mismatches,missing
+lemma33,500,5,42,1,3,0.000015,0.000050,0.306354,1,0,0
+lemma33,1000,5,42,1,3,0.000008,0.000136,0.060625,1,0,0
+baseline,500,5,42,1,3,0.000005,0.000078,0.061962,1,0,0
+baseline,1000,5,42,1,3,0.000006,0.000127,0.043615,1,0,0

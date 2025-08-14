@@ -1,0 +1,4 @@
+n=600, outdeg=3, Sigma=1, Tau=3
+BMSSP_time(s)=0.000045, Dijkstra_time(s)=0.000128, time_ratio(BMSSP/Dij)=0.350280
+verify: checked=1, mismatches=0, missing=0
+status: OK

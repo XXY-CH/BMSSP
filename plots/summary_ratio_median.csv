@@ -1,0 +1,7 @@
+variant,model,ratio
+baseline,large,0.0111595
+baseline,medium,0.023636
+baseline,small,0.082862
+lemma33,large,0.0106555
+lemma33,medium,0.026041
+lemma33,small,0.069997
